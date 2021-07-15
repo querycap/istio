@@ -1,7 +1,11 @@
+# all need run on aarch host
+
 HUB ?= docker.io/querycapistio
 TEMP_ROOT = ${PWD}/.tmp
 
 BUILD_TOOLS_VERSION = master-latest
+BUILD_TOOLS_IMAGE = $(HUB)/build-tools:$(BUILD_TOOLS_VERSION)
+BUILD_TOOLS_PROXY_IMAGE = $(HUB)/build-tools-proxy:$(BUILD_TOOLS_VERSION)
 
 clean.build-tools:
 	rm -rf $(TEMP_ROOT)/tools
@@ -9,8 +13,7 @@ clean.build-tools:
 clone.build-tools:
 	git clone --depth=1 https://github.com/istio/tools.git $(TEMP_ROOT)/tools
 
-# Build build-tools-proxy for arm64
-# need run aarch64 host
+# Build build-tools && build-tools-proxy for arm64
 dockerx.build-tools: clean.build-tools clone.build-tools
 	cd $(TEMP_ROOT)/tools/docker/build-tools \
 		&& DRY_RUN=1 HUB=$(HUB) CONTAINER_BUILDER="buildx build --push --platform=linux/arm64" ./build-and-push.sh
@@ -35,7 +38,6 @@ clone.envoy: cleanup.istio clone.istio
 	cd $(TEMP_ROOT)/proxy && git checkout $(shell cat $(TEMP_ROOT)/istio/istio.deps | grep lastStableSHA | sed 's/.*"lastStableSHA": "\([a-zA-Z0-9]*\)"/\1/g')
 
 # Build envoy
-# need run aarch64 host
 # /tmp/bazel here should must be link here, cause, bazel-out is symlink to TEST_TMPDIR
 build.envoy: cleanup.envoy clone.envoy
 	docker pull $(HUB)/build-tools-proxy:$(BUILD_TOOLS_VERSION)
@@ -45,7 +47,7 @@ build.envoy: cleanup.envoy clone.envoy
 		-v=/tmp/bazel:/tmp/bazel \
 		-v=$(TEMP_ROOT)/proxy:/go/src/istio/proxy \
 		-w=/go/src/istio/proxy \
-		$(HUB)/build-tools-proxy:$(BUILD_TOOLS_VERSION) make build_envoy
+		$(BUILD_TOOLS_PROXY_IMAGE) make build_envoy
 	mkdir -p $(TEMP_ROOT)/envoy-linux-arm64 && cp $(TEMP_ROOT)/proxy/bazel-bin/src/envoy/envoy $(TEMP_ROOT)/envoy-linux-arm64/envoy
 
 cleanup.istio:
@@ -60,36 +62,35 @@ ISTIO_ENVOY_LINUX_ARM64_RELEASE_DIR = $(TEMP_ROOT)/istio/out/linux_arm64/release
 AGENT_BINARIES := ./pilot/cmd/pilot-agent
 STANDARD_BINARIES := ./pilot/cmd/pilot-discovery ./operator/cmd/operator
 
+ISTIO_MAKE = cd $(TEMP_ROOT)/istio && IMG=$(BUILD_TOOLS_IMAGE) HUB=$(HUB) BASE_VERSION=$(TAG) TAG=$(TAG) make
+
 # Build istio binaries and copy envoy binary for arm64
 # in github actions it will download from artifacts
 build.istio:
 	cd $(TEMP_ROOT)/istio \
-    		&& make build-linux TARGET_ARCH=amd64 STANDARD_BINARIES="$(STANDARD_BINARIES)" AGENT_BINARIES="$(AGENT_BINARIES)"
+    	&& $(ISTIO_MAKE) build-linux TARGET_ARCH=amd64 STANDARD_BINARIES="$(STANDARD_BINARIES)" AGENT_BINARIES="$(AGENT_BINARIES)"
 	cd $(TEMP_ROOT)/istio \
-		&& make build-linux TARGET_ARCH=arm64 STANDARD_BINARIES="$(STANDARD_BINARIES)" AGENT_BINARIES="$(AGENT_BINARIES)" \
+		&& $(ISTIO_MAKE) build-linux TARGET_ARCH=arm64 STANDARD_BINARIES="$(STANDARD_BINARIES)" AGENT_BINARIES="$(AGENT_BINARIES)" \
 		&& cp $(TEMP_ROOT)/envoy-linux-arm64/envoy $(ISTIO_ENVOY_LINUX_ARM64_RELEASE_DIR)/envoy
 
 ESCAPED_HUB := $(shell echo $(HUB) | sed "s/\//\\\\\//g")
 
-# Replace istio base images
+# Replace istio base images and pull latest BUILD_TOOLS_IMAGE
 # sed must be gnu sed
 dockerx.istio.prepare:
 	sed -i -e 's/gcr.io\/istio-release\/\(base\|distroless\)/$(ESCAPED_HUB)\/\1/g' $(TEMP_ROOT)/istio/pilot/docker/Dockerfile.pilot
-	cat $(TEMP_ROOT)/istio/pilot/docker/Dockerfile.pilot
 	sed -i -e 's/gcr.io\/istio-release\/\(base\|distroless\)/$(ESCAPED_HUB)\/\1/g' $(TEMP_ROOT)/istio/pilot/docker/Dockerfile.proxyv2
-	cat $(TEMP_ROOT)/istio/pilot/docker/Dockerfile.proxyv2
 	sed -i -e 's/gcr.io\/istio-release\/\(base\|distroless\)/$(ESCAPED_HUB)\/\1/g' $(TEMP_ROOT)/istio/operator/docker/Dockerfile.operator
-	cat $(TEMP_ROOT)/istio/operator/docker/Dockerfile.operator
-
-COMPONENTS = proxyv2 pilot operator
+	docker pull $(BUILD_TOOLS_IMAGE)
 
 # Build istio base images as multi-arch
-# need run x86_64 host
 dockerx.istio-base:
-	cd $(TEMP_ROOT)/istio && make dockerx.base TARGET_ARCH=amd64 HUB=$(HUB) TAG=$(TAG) DOCKERX_PUSH=true DOCKER_ARCHITECTURES=linux/amd64,linux/arm64
-	cd $(TEMP_ROOT)/istio && make dockerx.distroless TARGET_ARCH=amd64 HUB=$(HUB) TAG=$(TAG) DOCKERX_PUSH=true DOCKER_ARCHITECTURES=linux/amd64,linux/arm64
+	$(ISTIO_MAKE) dockerx.base DOCKERX_PUSH=true DOCKER_ARCHITECTURES=linux/amd64,linux/arm64
+	$(ISTIO_MAKE) dockerx.distroless DOCKERX_PUSH=true DOCKER_ARCHITECTURES=linux/amd64,linux/arm64
 
-# Build istio images  as multi-arch
-# need run x86_64 host
-dockerx.istio: cleanup.istio clone.istio dockerx.istio.prepare dockerx.istio-base build.istio
-	$(foreach component,$(COMPONENTS),cd $(TEMP_ROOT)/istio && make dockerx.$(component) TARGET_ARCH=amd64 HUB=$(HUB) BASE_VERSION=$(TAG) TAG=$(TAG) DOCKERX_PUSH=true DOCKER_BUILD_VARIANTS="default distroless" DOCKER_ARCHITECTURES=linux/amd64,linux/arm64;)
+COMPONENTS = proxyv2 pilot operator
+dockerx.istio-components: dockerx.istio.prepare dockerx.istio-base
+	$(foreach component,$(COMPONENTS),cd $(TEMP_ROOT)/istio && $(ISTIO_MAKE) dockerx.$(component) DOCKERX_PUSH=true DOCKER_BUILD_VARIANTS="default distroless" DOCKER_ARCHITECTURES=linux/amd64,linux/arm64;)
+
+# Build istio images as multi-arch
+dockerx.istio: cleanup.istio clone.istio build.istio dockerx.istio-components
